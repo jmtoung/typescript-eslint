@@ -1,11 +1,17 @@
 import {
   AST_NODE_TYPES,
+  AST_TOKEN_TYPES,
+  JSONSchema,
   TSESLint,
   TSESTree,
 } from '@typescript-eslint/experimental-utils';
 import * as util from '../util';
+import { RuleFix, RuleFixer } from '@typescript-eslint/experimental-utils/dist/ts-eslint';
 
-export type MessageIds = 'incorrectGroupOrder' | 'incorrectOrder';
+export type MessageIds =
+  | 'incorrectGroupOrder'
+  | 'incorrectOrder'
+  | 'incorrectOrderAlphabetical';
 
 interface SortedOrderConfig {
   memberTypes?: string[] | 'never';
@@ -25,19 +31,19 @@ export type Options = [
   },
 ];
 
-const neverConfig = {
+const neverConfig: JSONSchema.JSONSchema4 = {
   type: 'string',
   enum: ['never'],
 };
 
-const arrayConfig = (memberTypes: string[]): object => ({
+const arrayConfig = (memberTypes: string[]): JSONSchema.JSONSchema4 => ({
   type: 'array',
   items: {
     enum: memberTypes,
   },
 });
 
-const objectConfig = (memberTypes: string[]): object => ({
+const objectConfig = (memberTypes: string[]): JSONSchema.JSONSchema4 => ({
   type: 'object',
   properties: {
     memberTypes: {
@@ -123,7 +129,7 @@ export const defaultOrder = [
 
 const allMemberTypes = ['signature', 'field', 'method', 'constructor'].reduce<
   string[]
->((all, type) => {
+  >((all, type) => {
   all.push(type);
 
   ['public', 'protected', 'private'].forEach(accessibility => {
@@ -346,11 +352,14 @@ export default util.createRule<Options, MessageIds>({
       category: 'Stylistic Issues',
       recommended: false,
     },
+    fixable: 'code',
     messages: {
       incorrectOrder:
         'Member "{{member}}" should be declared before member "{{beforeMember}}".',
       incorrectGroupOrder:
         'Member {{name}} should be declared before all {{rank}} definitions.',
+      incorrectOrderAlphabetical:
+        'Members of type literal should be sorted. Run with --fix to autofix.',
     },
     schema: [
       {
@@ -463,33 +472,164 @@ export default util.createRule<Options, MessageIds>({
      * @return True if all members are correctly sorted.
      */
     function checkAlphaSort(members: Member[]): boolean {
-      let previousName = '';
-      let isCorrectlySorted = true;
-
-      // Find first member which isn't correctly sorted
-      members.forEach(member => {
-        const name = getMemberName(member, context.getSourceCode());
-
-        // Note: Not all members have names
-        if (name) {
-          if (name < previousName) {
-            context.report({
-              node: member,
-              messageId: 'incorrectOrder',
-              data: {
-                member: name,
-                beforeMember: previousName,
-              },
-            });
-
-            isCorrectlySorted = false;
-          }
-
-          previousName = name;
+      // Make a copy of members and sort them
+      const sortedMembers = members.slice();
+      sortedMembers.sort((a, b) => {
+        const aName = getMemberName(a, context.getSourceCode());
+        const bName = getMemberName(b, context.getSourceCode());
+        if (!aName) {
+          return 1;
         }
+        if (!bName) {
+          return -1;
+        }
+        if (aName === bName) {
+          return 0;
+        }
+        return aName < bName ? -1 : 1;
       });
 
-      return isCorrectlySorted;
+      const membersAreSorted =
+        members.length === sortedMembers.length &&
+        members.every((member, index) => member === sortedMembers[index]);
+
+      if (membersAreSorted) {
+        return membersAreSorted;
+      }
+
+      function isPunctuatorString(s: string): boolean {
+        return s === ',' || s === ';'
+      }
+
+      function isPunctuatorNode(node: TSESTree.Token): boolean {
+        return node.type === AST_TOKEN_TYPES.Punctuator && node.value === '}';
+      }
+
+      function fix(fixer: RuleFixer): RuleFix[] {
+        const fixes: RuleFix[] = [];
+        const sourceCode = context.getSourceCode();
+
+        function moveProperty(fromNode: Member, toNode: Member): void {
+          const { leading, trailing } = sourceCode.getComments(fromNode);
+
+          leading.forEach(leadingComment => {
+            const prevToken = sourceCode.getTokenBefore(leadingComment)
+            // If previous token is on same line as leadingComment and
+            // leadingComment is a line comment, then that means the line
+            // comment is not on its own line and should not be considered as a
+            // leading comment (as it will be captured by a trailing comment)
+            if (leadingComment.type === AST_TOKEN_TYPES.Line && prevToken && prevToken.loc.end.line === leadingComment.loc.end.line) {
+              return
+            }
+            // Range needs to start from column 0 so that you grab the entire line
+            const fullLeadingCommentStart = sourceCode.getIndexFromLoc({
+              ...leadingComment.loc.start,
+              column: 0,
+            });
+            // Increase index by 1 to capture new line
+            const fullLeadingCommentEnd = leadingComment.range[1] + 1;
+            const insertRange = sourceCode.getIndexFromLoc({
+              ...toNode.loc.start,
+              column: 0,
+            });
+            // Add leading comments from fromNode to toNode
+            fixes.push(
+              fixer.insertTextBeforeRange(
+                [insertRange, toNode.range[1]],
+                sourceCode.text.slice(
+                  fullLeadingCommentStart,
+                  fullLeadingCommentEnd,
+                ),
+              ),
+            );
+            // Remove comment from fromNode
+            fixes.push(
+              fixer.removeRange([
+                fullLeadingCommentStart,
+                fullLeadingCommentEnd,
+              ]),
+            );
+          });
+          trailing.forEach(trailingComment => {
+            if (trailingComment.type === AST_TOKEN_TYPES.Block || trailingComment.loc.start.line !== fromNode.loc.start.line) {
+              return;
+            }
+            const tokenBefore = sourceCode.getTokenBefore(trailingComment);
+            const fullTrailingCommentStart = tokenBefore
+              ? tokenBefore.range[1]
+              : trailingComment.range[0];
+            const fullTrailingCommentEnd = trailingComment.range[1];
+            // Add trailing comments from fromNode to toNode
+            fixes.push(
+              fixer.insertTextAfterRange(
+                toNode.range,
+                sourceCode.text.slice(
+                  fullTrailingCommentStart,
+                  fullTrailingCommentEnd,
+                ),
+              ),
+            );
+            // Remove comment from fromNode
+            fixes.push(
+              fixer.removeRange([
+                fullTrailingCommentStart,
+                fullTrailingCommentEnd,
+              ]),
+            );
+          });
+
+          const fromNodeText = sourceCode.getText(fromNode);
+          const toNodeText = sourceCode.getText(toNode);
+          const fromNodeTextEndsInPuncator = isPunctuatorString(fromNodeText.charAt(fromNodeText.length - 1))
+          const toNodeTextEndsInPunctuator = isPunctuatorString(toNodeText.charAt(toNodeText.length - 1))
+
+          // If the toNode is the last (followed by '}' punctuator) AND the
+          // toNode does not have a punctuator AND the from node does, remove
+          // the punctuator from the fromNode.
+          const tokenAfterToNode = sourceCode.getTokenAfter(toNode);
+          const shouldRemovePunctuator = tokenAfterToNode &&
+            isPunctuatorNode(tokenAfterToNode) &&
+            fromNodeTextEndsInPuncator &&
+            !toNodeTextEndsInPunctuator;
+          const replacementText = shouldRemovePunctuator
+            ? fromNodeText.slice(0, -1)
+            : fromNodeText;
+          fixes.push(fixer.replaceText(toNode, replacementText));
+
+          // If the fromNode is the last (followed by '}' punctuator) AND the
+          // toNode to which it is going has a punctuator AND the fromNode
+          // itself is missing a punctuator, add the toNode's punctuator.
+          const tokenAfterFromNode = sourceCode.getTokenAfter(fromNode);
+          const shouldAddPunctuator =
+            tokenAfterFromNode &&
+            isPunctuatorNode(tokenAfterFromNode) &&
+            toNodeTextEndsInPunctuator &&
+            !fromNodeTextEndsInPuncator
+          const punctuator = sourceCode.text.slice(
+            toNode.range[1] - 1,
+            toNode.range[1],
+          );
+          if (shouldAddPunctuator) {
+            fixes.push(fixer.insertTextAfter(toNode, punctuator));
+          }
+        }
+
+        members.forEach((toNode, index) => {
+          if (toNode !== sortedMembers[index]) {
+            moveProperty(sortedMembers[index], toNode);
+          }
+        });
+
+        return fixes;
+      }
+
+      context.report({
+        node: members[0],
+        messageId: 'incorrectOrderAlphabetical',
+        fix,
+      });
+
+      return membersAreSorted;
     }
 
     /**
